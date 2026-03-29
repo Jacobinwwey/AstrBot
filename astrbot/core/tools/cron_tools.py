@@ -17,6 +17,22 @@ def _extract_job_session(job: Any) -> str | None:
     return str(session) if session is not None else None
 
 
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
 @dataclass
 class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
     name: str = "create_future_task"
@@ -46,10 +62,26 @@ class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
                 },
                 "run_once": {
                     "type": "boolean",
-                    "description": "If true, the task will run only once and then be deleted. Use run_at to specify the time.",
+                    "description": "If true, the task will run only once and then be deleted. Use run_at to specify the time. If run_at is provided and cron_expression is omitted, the tool may auto-treat this as run_once=true.",
                 },
             },
             "required": ["note"],
+            "anyOf": [
+                {"required": ["cron_expression"]},
+                {"required": ["run_at"]},
+            ],
+            "examples": [
+                {
+                    "note": "Every workday 09:00 check CI status and report.",
+                    "cron_expression": "0 9 * * mon-fri",
+                    "run_once": False,
+                },
+                {
+                    "note": "Tomorrow 08:30 remind me to review outline.",
+                    "run_once": True,
+                    "run_at": "2026-03-15T08:30:00+08:00",
+                },
+            ],
         }
     )
 
@@ -60,18 +92,40 @@ class CreateActiveCronTool(FunctionTool[AstrAgentContext]):
         if cron_mgr is None:
             return "error: cron manager is not available."
 
-        cron_expression = kwargs.get("cron_expression")
-        run_at = kwargs.get("run_at")
-        run_once = bool(kwargs.get("run_once", False))
+        cron_expression_raw = kwargs.get("cron_expression")
+        run_at_raw = kwargs.get("run_at")
+        cron_expression = (
+            str(cron_expression_raw).strip() if cron_expression_raw is not None else ""
+        )
+        run_at = str(run_at_raw).strip() if run_at_raw is not None else ""
+        cron_expression = cron_expression or None
+        run_at = run_at or None
+        run_once = _parse_bool(
+            kwargs.get("run_once"),
+            default=bool(run_at and not cron_expression),
+        )
         note = str(kwargs.get("note", "")).strip()
         name = str(kwargs.get("name") or "").strip() or "active_agent_task"
 
+        # Common LLM/tool-schema mismatch guard:
+        # if run_at is provided without cron_expression, treat as one-time task.
+        if run_at and not cron_expression and not run_once:
+            run_once = True
+
         if not note:
             return "error: note is required."
+        if not run_at and not cron_expression:
+            return (
+                "error: schedule is required. Provide either "
+                "`cron_expression` (recurring) or `run_at` (one-time ISO datetime)."
+            )
         if run_once and not run_at:
             return "error: run_at is required when run_once=true."
         if (not run_once) and not cron_expression:
-            return "error: cron_expression is required when run_once=false."
+            return (
+                "error: cron_expression is required when run_once=false. "
+                "For one-time tasks, set run_once=true and provide run_at."
+            )
         if run_once and cron_expression:
             cron_expression = None
         run_at_dt = None
